@@ -1,0 +1,12 @@
+{
+    "name": "yasser/vite-gourmand",
+    "authors": [
+        {
+            "name": "kskyasser",
+            "email": "kossokoyasser@gmail.com"
+        }
+    ],
+    "require": {
+        "mongodb/mongodb": "^2.2"
+    }
+}

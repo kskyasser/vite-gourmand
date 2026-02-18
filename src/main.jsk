@@ -1,0 +1,1164 @@
+import './style.css'
+
+const app = document.querySelector('#app')
+
+// ===== API =====
+async function api(url, options = {}) {
+  const res = await fetch(url, { credentials: 'include', ...options })
+  const text = await res.text()
+  let data
+  try { data = JSON.parse(text) } catch { data = text }
+  if (!res.ok) throw data
+  return data
+}
+
+function escapeHtml(str) {
+  return String(str)
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+}
+
+async function getMe() {
+  try {
+    const data = await api('/api/me.php')
+    return data.user
+  } catch {
+    return null
+  }
+}
+
+// ===== ROUTER =====
+window.addEventListener('hashchange', router)
+router()
+
+async function router() {
+  const hash = location.hash || '#/'
+  const [path, query] = hash.slice(1).split('?')
+  const params = new URLSearchParams(query || '')
+  const me = await getMe()
+
+  try {
+if (path === '/') { await pageHome(me); loadHorairesFooter(); return }
+if (path === '/menu') { await pageMenu(params, me); loadHorairesFooter(); return }
+if (path === '/commandes') { await pageCommandesManage(me); loadHorairesFooter(); return }
+// AUTH
+if (path === '/login') { await pageLogin(me); loadHorairesFooter(); return }
+if (path === '/register') { await pageRegister(me); loadHorairesFooter(); return }
+if (path === '/logout') { await pageLogout(); loadHorairesFooter(); return }
+
+// USER
+if (path === '/mes-commandes') { await pageMesCommandes(me); loadHorairesFooter(); return }
+if (path === '/contacts') { await pageContacts(me); loadHorairesFooter(); return }
+if (path === '/avis-create') { await pageAvisCreate(me); loadHorairesFooter(); return }
+if (path === '/avis-manage') { await pageAvisManage(me); loadHorairesFooter(); return }
+
+    // PAGES
+   if (path === '/mentions-legales') {
+  app.innerHTML = pageMentionsLegales(me)
+  loadHorairesFooter()
+  return
+}
+
+
+    // 404
+    app.innerHTML = layout(me, `<h2>404</h2>`)
+    loadHorairesFooter()
+
+  } catch (err) {
+    app.innerHTML = layout(me, `<pre style="white-space:pre-wrap">${escapeHtml(JSON.stringify(err, null, 2))}</pre>`)
+    loadHorairesFooter()
+  }
+}
+
+let horairesCache = null
+
+function formatHeure(h) {
+  if (!h) return null
+  // "09:00:00" -> "09h00"
+  const hh = h.slice(0, 2)
+  const mm = h.slice(3, 5)
+  return `${hh}h${mm}`
+}
+
+function renderHorairesFooter(rows) {
+  if (!Array.isArray(rows) || rows.length === 0) return 'Horaires indisponibles'
+
+  return rows.map(r => {
+    const jour = r.jour ? r.jour.charAt(0).toUpperCase() + r.jour.slice(1) : 'Jour'
+    const o = formatHeure(r.heure_ouverture)
+    const f = formatHeure(r.heure_fermeture)
+
+    if (!o || !f) return `${escapeHtml(jour)} : fermé`
+    return `${escapeHtml(jour)} : ${escapeHtml(o)} – ${escapeHtml(f)}`
+  }).join('<br>')
+}
+
+
+// =======================
+// PAGE : LAISSER UN AVIS
+// =======================
+async function pageAvisCreate(me) {
+  if (!me) { location.hash = '#/login'; return }
+
+  app.innerHTML = layout(me, `
+    <article class="card">
+      <h2 style="margin-top:0">Laisser un avis</h2>
+
+      <form id="avisForm" style="display:grid; gap:12px; max-width:520px">
+        <label>
+          Menu concerné
+          <select name="menu_id" id="avisMenu" required>
+            <option value="">Chargement…</option>
+          </select>
+        </label>
+
+        <label>
+          Note (1 à 5)
+          <input type="number" name="note" min="1" max="5" value="5" required>
+        </label>
+
+        <label>
+          Commentaire
+          <textarea name="commentaire" rows="4" required
+            placeholder="Ex : Très bon service, livraison à l’heure."></textarea>
+        </label>
+
+        <button class="btn" type="submit">Envoyer l’avis</button>
+        <div id="avisMsg" class="sub"></div>
+      </form>
+
+      <p class="sub" style="margin-top:12px">
+        ⚠️ Règle ECF : avis possible uniquement après une commande terminée pour ce menu.
+      </p>
+    </article>
+  `)
+
+  loadHorairesFooter()
+
+  const form = document.getElementById('avisForm')
+  const msg = document.getElementById('avisMsg')
+  const select = document.getElementById('avisMenu')
+
+  // 1) Charger les menus éligibles depuis "mes commandes"
+  try {
+    const orders = await api('/api/mes_commandes.php')
+
+    // On extrait les menus (en essayant plusieurs noms de champs possibles)
+    const menusMap = new Map()
+
+    ;(orders || []).forEach(o => {
+      const statut = String(o.statut || o.status || '').toLowerCase()
+      const isTerminee = statut === 'terminee' || statut === 'terminée' || statut === 'termine' || statut === 'delivree'
+
+      // si l’API ne renvoie pas le statut, on laisse passer (mais l’API backend tranchera)
+      const ok = (statut === '') ? true : isTerminee
+
+      const menuId = Number(o.menu_id || o.menuId || o.id_menu || 0)
+      const menuTitre = o.menu_titre || o.titre_menu || o.menu || o.titre || `Menu #${menuId}`
+
+      if (ok && menuId > 0) menusMap.set(menuId, menuTitre)
+    })
+
+    const menus = [...menusMap.entries()]
+
+    if (menus.length === 0) {
+      select.innerHTML = `<option value="">Aucun menu éligible</option>`
+      msg.textContent = "Tu n'as pas de commande terminée : tu ne peux pas encore laisser d’avis."
+      form.querySelector('button[type="submit"]').disabled = true
+      return
+    }
+
+    select.innerHTML = `<option value="">-- Choisir un menu --</option>` + menus
+      .map(([id, titre]) => `<option value="${id}">${escapeHtml(String(titre))}</option>`)
+      .join('')
+
+  } catch (e) {
+    select.innerHTML = `<option value="">Erreur de chargement</option>`
+    msg.textContent = "Erreur : impossible de récupérer tes commandes."
+    form.querySelector('button[type="submit"]').disabled = true
+    return
+  }
+
+  // 2) Envoyer l’avis (JSON accepté par avis_create.php)
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault()
+    msg.textContent = 'Envoi en cours...'
+
+    const payload = {
+      user_id: Number(me.id),
+      menu_id: Number(form.menu_id.value),
+      note: Number(form.note.value),
+      commentaire: String(form.commentaire.value || '')
+    }
+
+    try {
+      const res = await api('/api/avis_create.php', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      })
+
+      msg.textContent = res?.message ? res.message : 'Avis envoyé (en attente de validation).'
+      form.reset()
+      // Remet le select au premier choix
+      select.value = ''
+    } catch (err) {
+      msg.textContent = 'Erreur : ' + (err?.message || "impossible d’envoyer l’avis.")
+    }
+  })
+}
+
+
+async function loadHorairesFooter() {
+  const el = document.getElementById('horaires-footer')
+  if (!el) return
+
+  try {
+    const res = await fetch('/api/horaires.php')
+    if (!res.ok) throw new Error('HTTP ' + res.status)
+
+    const rows = await res.json()
+    el.innerHTML = renderHorairesFooter(rows)
+  } catch (e) {
+    console.error(e)
+    el.textContent = 'Horaires indisponibles'
+  }
+}
+
+// =======================
+// PAGE : GESTION DES AVIS (employé/admin)
+// =======================
+async function pageAvisManage(me) {
+  if (!me) { location.hash = '#/login'; return }
+
+  const role = (me.role || '').toLowerCase()
+  const isStaff = role === 'employe' || role === 'admin'
+  if (!isStaff) {
+    app.innerHTML = layout(me, `
+      <article class="card">
+        <h2 style="margin-top:0">Gestion des avis</h2>
+        <p class="sub">Accès réservé à un employé / admin.</p>
+      </article>
+    `)
+    loadHorairesFooter()
+    return
+  }
+
+  app.innerHTML = layout(me, `
+    <article class="card">
+      <h2 style="margin-top:0">Gestion des avis</h2>
+      <p class="sub">Valider ou refuser les avis en attente.</p>
+      <div id="avisList" class="grid">
+        <div class="card" style="box-shadow:none; margin:0">Chargement…</div>
+      </div>
+    </article>
+  `)
+
+  const box = document.getElementById('avisList')
+
+  async function fetchAvisAll() {
+    // On essaye d'abord une version "all=1" (si ton API la gère)
+    try { return await api('/api/avis.php?all=1') } catch (e) {}
+    // Sinon on essaye sans paramètre
+    return await api('/api/avis.php')
+  }
+
+  function render(list) {
+    if (!Array.isArray(list) || list.length === 0) {
+      box.innerHTML = `<div class="card" style="box-shadow:none; margin:0">Aucun avis.</div>`
+      return
+    }
+
+    // On affiche tout, et on met en avant ceux "en attente"
+    box.innerHTML = list.map(a => {
+      const id = a.id
+      const note = a.note ?? ''
+      const commentaire = a.commentaire ?? a.texte ?? ''
+      const auteur = a.user_prenom ?? a.prenom ?? a.email ?? '—'
+      const date = a.created_at ?? ''
+      const statut = (a.statut ?? a.is_validated ?? a.valide ?? '').toString().toLowerCase()
+
+      const isPending =
+        statut === '0' || statut === 'pending' || statut === 'en_attente' || statut === '' || statut === 'null'
+
+      const badge = isPending
+        ? `<span style="padding:2px 8px;border-radius:999px;background:#fff7ed;border:1px solid #fed7aa;color:#9a3412;font-size:12px">En attente</span>`
+        : `<span style="padding:2px 8px;border-radius:999px;background:#ecfdf5;border:1px solid #a7f3d0;color:#065f46;font-size:12px">Validé</span>`
+
+      return `
+        <article class="card">
+          <div style="display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap">
+            <div>
+              <strong>${escapeHtml(auteur)}</strong>
+              <div class="sub">Note : ${escapeHtml(String(note))} / 5</div>
+            </div>
+            <div style="display:flex; gap:8px; align-items:center">
+              ${badge}
+              <small>${escapeHtml(String(date))}</small>
+            </div>
+          </div>
+
+          <hr style="margin:12px 0">
+
+          <div style="white-space:pre-wrap">${escapeHtml(String(commentaire))}</div>
+
+          <div style="margin-top:12px; display:flex; gap:8px; flex-wrap:wrap">
+            ${isPending ? `
+              <button class="btn" data-act="valider" data-id="${id}">Valider</button>
+              <button class="btn" style="background:#fff;border:1px solid #e2e8f0;color:#0f172a" data-act="refuser" data-id="${id}">Refuser</button>
+            ` : `
+              <button class="btn" style="background:#fff;border:1px solid #e2e8f0;color:#0f172a" disabled>Déjà validé</button>
+            `}
+          </div>
+        </article>
+      `
+    }).join('')
+
+    // Actions
+    box.querySelectorAll('button[data-act]').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const id = Number(btn.getAttribute('data-id'))
+        const act = btn.getAttribute('data-act')
+
+        try {
+          // On tente les 2 formats les plus courants
+          // 1) /api/avis_validate.php { id, action }
+          await api('/api/avis_validate.php', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id, action: act })
+          })
+        } catch (e1) {
+          try {
+            // 2) /api/avis_validate.php?id=...&action=...
+            await api(`/api/avis_validate.php?id=${encodeURIComponent(id)}&action=${encodeURIComponent(act)}`)
+          } catch (e2) {
+            alert("Impossible de valider/refuser l'avis. Vérifie l'API avis_validate.php.")
+            return
+          }
+        }
+
+        // Recharge la liste après action
+        try {
+          const list2 = await fetchAvisAll()
+          render(list2)
+        } catch (e) {
+          // ignore
+        }
+      })
+    })
+  }
+
+  try {
+    const list = await fetchAvisAll()
+    render(list)
+  } catch (e) {
+    box.innerHTML = `<div class="card" style="box-shadow:none; margin:0">Erreur de chargement.</div>`
+  }
+
+  loadHorairesFooter()
+}
+
+
+function layout(me, content) {
+  const role = (me?.role || '').toLowerCase()
+  const isUser = role === 'utilisateur'
+  const isStaff = role === 'employe' || role === 'admin'
+
+  return `
+
+    <div class="container">
+
+      <header class="header">
+        <div class="brand">
+          <div class="logo">VG</div>
+          <div>
+            <h1 style="margin:0">Vite & Gourmand</h1>
+            <p class="sub" style="margin:6px 0 0">
+              ${me ? `Connecté : ${escapeHtml(me.prenom)} (${escapeHtml(me.role)})` : 'Non connecté'}
+            </p>
+          </div>
+        </div>
+
+
+        <nav style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
+          <a href="#/">Accueil</a>
+${isStaff ? `<a href="#/contacts">Contacts</a>` : ``}
+${isStaff ? `<a href="#/commandes">Commandes</a>` : ``}
+${isUser ? `<a href="#/avis-create">Laisser un avis</a>` : ``}
+${isStaff ? `<a href="#/avis-manage">Avis</a>` : ``}
+          ${me ? `<a href="#/mes-commandes">Mes commandes</a>` : ``}
+          ${me
+            ? `<a href="#/logout">Logout</a>`
+            : `<a href="#/login">Login</a><a href="#/register">Register</a>`
+          }
+        </nav>
+      </header>
+
+      ${content}
+
+      <footer style="margin-top:40px; padding-top:20px; border-top:1px solid #e2e8f0; font-size:14px; color:#64748b">
+        <div style="display:grid; gap:12px">
+
+<div>
+  <strong>Horaires</strong><br>
+  <div id="horaires-footer">Chargement des horaires...</div>
+</div>
+
+          <div>
+            <strong>Vite & Gourmand</strong><br>
+            12 rue de la Gastronomie, 33000 Bordeaux<br>
+            Email : contact@vite-gourmand.fr<br>
+            Téléphone : 05 56 00 00 00
+          </div>
+
+          <div>
+            <a href="#/mentions-legales">Mentions légales</a> ·
+            <a href="#/cgv">CGV</a>
+          </div>
+
+        </div>
+      </footer>
+
+    </div>
+  `
+}
+
+// ===== HOME =====
+async function pageHome(me) {
+  const menus = await api('/api/menus.php')
+  app.innerHTML = layout(me, `
+    <section class="card" style="margin-bottom:24px">
+      <h2>Bienvenue chez Vite & Gourmand</h2>
+      <p>
+        Vite & Gourmand est un service de restauration spécialisé dans la livraison
+        de menus gourmands pour vos événements privés et professionnels.
+      </p>
+      <p>
+        Nous travaillons avec des produits frais et proposons des menus adaptés
+        au nombre de convives, livrés directement à domicile ou sur le lieu de l’événement.
+      </p>
+    </section>
+
+<section class="card" style="margin-bottom:24px">
+  <h2>Avis validés de nos clients</h2>
+  <div id="avisHome" class="grid">
+    <div class="card" style="box-shadow:none; margin:0">Chargement des avis…</div>
+  </div>
+</section>
+
+    <h2 style="margin:0 0 12px">Nos menus</h2>
+
+    <section class="card" style="margin-bottom:18px">
+      <h3 style="margin-top:0">Filtres</h3>
+
+      <div style="display:grid; gap:10px; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));">
+        <label>
+          Prix max (€)
+          <input id="fPrixMax" type="number" min="0" step="1" placeholder="ex: 120">
+        </label>
+
+        <label>
+          Nb personnes (au moins)
+          <input id="fNb" type="number" min="1" step="1" placeholder="ex: 10">
+        </label>
+      </div>
+
+      <div style="margin-top:12px">
+        <button id="btnReset" type="button">Réinitialiser</button>
+      </div>
+    </section>
+
+    <div id="menusCount" style="margin:0 0 10px; color:#64748b"></div>
+
+    <section class="grid" id="menusGrid"></section>
+  `)
+
+  // Charger les avis validés (depuis la base)
+  ;(async () => {
+    const box = document.getElementById('avisHome')
+    if (!box) return
+
+    try {
+      const data = await api('/api/avis.php')
+      let avis = Array.isArray(data) ? data : (data.avis || data.items || [])
+
+      // garder uniquement les validés si champ présent
+      avis = avis.filter(a => {
+        const v = a.is_validated ?? a.validated ?? a.valide ?? a.isValidated
+        if (v === undefined) return true
+        return String(v) === '1' || v === 1 || v === true || String(v).toLowerCase() === 'true'
+      })
+
+      if (!avis.length) {
+        box.innerHTML = `<div class="card" style="box-shadow:none; margin:0">Aucun avis pour le moment.</div>`
+        return
+      }
+
+      avis = avis.slice(0, 6)
+
+      const stars = (n) => {
+        const x = Math.max(0, Math.min(5, Number(n) || 0))
+        return '★★★★★'.slice(0, x) + '☆☆☆☆☆'.slice(0, 5 - x)
+      }
+
+      box.innerHTML = avis.map(a => {
+        const auteur = a.user_prenom || a.prenom || a.user || a.auteur || 'Client'
+        const note = a.note ?? ''
+        const commentaire = a.commentaire ?? a.texte ?? ''
+        const date = a.created_at ?? a.date ?? ''
+
+        return `
+          <article class="card" style="box-shadow:none; margin:0; border:1px solid #e2e8f0">
+            <div style="display:flex; justify-content:space-between; gap:10px; flex-wrap:wrap">
+              <strong>${escapeHtml(auteur)}</strong>
+              <div style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace">
+                ${escapeHtml(stars(note))} <span class="sub">(${escapeHtml(String(note))}/5)</span>
+              </div>
+            </div>
+            <div class="sub" style="margin-top:6px">${escapeHtml(String(date))}</div>
+            <p style="margin-top:10px; white-space:pre-wrap">${escapeHtml(String(commentaire))}</p>
+          </article>
+        `
+      }).join('')
+    } catch (e) {
+      box.innerHTML = `<div class="card" style="box-shadow:none; margin:0">Erreur de chargement des avis.</div>`
+    }
+  })()
+
+  const grid = document.querySelector('#menusGrid')
+  const count = document.querySelector('#menusCount')
+  const fPrixMax = document.querySelector('#fPrixMax')
+  const fNb = document.querySelector('#fNb')
+  const btnReset = document.querySelector('#btnReset')
+
+  function render(list) {
+    count.textContent = `${list.length} menu(s) trouvé(s)`
+  
+  grid.innerHTML = list.map(m => `
+      <article class="card">
+
+${m.image_url ? `
+  <img 
+    src="${escapeHtml(m.image_url)}"
+    alt="${escapeHtml(m.titre)}"
+    style="width:100%; max-height:260px; object-fit:cover; border-radius:12px; margin:10px 0"
+  >
+` : ``}
+
+        <h3>${escapeHtml(m.titre)}</h3>
+        <p class="desc">${escapeHtml(m.description ?? '')}</p>
+        <div class="meta">
+          <span class="badge">💰 ${Number(m.prix_min).toFixed(2)} €</span>
+          <span class="badge">👥 min ${m.nb_personnes_min}</span>
+          ${m.stock != null ? `<span class="badge">📦 stock ${m.stock}</span>` : ``}
+        </div>
+        <p class="footer">
+          <a href="#/menu?id=${m.id}">Voir le menu →</a>
+        </p>
+      </article>
+    `).join('')
+  }
+
+  function applyFilters() {
+    const prixMax = Number(fPrixMax.value || 0)
+    const nb = Number(fNb.value || 0)
+
+    const filtered = menus.filter(m => {
+      const okPrix = !prixMax || Number(m.prix_min) <= prixMax
+      const okNb = !nb || Number(m.nb_personnes_min) <= nb
+      return okPrix && okNb
+    })
+
+    render(filtered)
+  }
+
+  fPrixMax.addEventListener('input', applyFilters)
+  fNb.addEventListener('input', applyFilters)
+
+  btnReset.addEventListener('click', () => {
+    fPrixMax.value = ''
+    fNb.value = ''
+    applyFilters()
+  })
+
+  // affichage initial
+  render(menus)
+}
+
+// ===== LOGIN =====
+async function pageLogin(me) {
+  app.innerHTML = layout(me, `
+    <article class="card">
+      <h2 style="margin-top:0">Connexion</h2>
+      <form id="loginForm" style="display:grid; gap:10px">
+        <label>Email <input name="email" required /></label>
+        <label>Mot de passe <input name="password" type="password" required /></label>
+        <button>Se connecter</button>
+      </form>
+      <pre id="out" style="white-space:pre-wrap; margin-top:12px"></pre>
+    </article>
+  `)
+
+  document.querySelector('#loginForm').addEventListener('submit', async (e) => {
+    e.preventDefault()
+    const fd = new FormData(e.target)
+    const out = document.querySelector('#out')
+    out.textContent = 'Connexion...'
+
+    try {
+      const data = await api('/api/auth_login.php', { method: 'POST', body: fd })
+      out.textContent = JSON.stringify(data, null, 2)
+      location.hash = '#/' // refresh header
+    } catch (err) {
+      out.textContent = JSON.stringify(err, null, 2)
+    }
+  })
+}
+
+// ===== REGISTER =====
+async function pageRegister(me) {
+  app.innerHTML = layout(me, `
+    <article class="card">
+      <h2 style="margin-top:0">Inscription</h2>
+      <form id="registerForm" style="display:grid; gap:10px">
+        <label>Nom <input name="nom" required /></label>
+        <label>Prénom <input name="prenom" required /></label>
+        <label>Email <input name="email" required /></label>
+        <label>GSM <input name="gsm" required /></label>
+        <label>Adresse <input name="adresse" required /></label>
+        <label>Mot de passe <input name="password" type="password" required /></label>
+        <button>S'inscrire</button>
+      </form>
+      <pre id="out" style="white-space:pre-wrap; margin-top:12px"></pre>
+    </article>
+  `)
+
+  document.querySelector('#registerForm').addEventListener('submit', async (e) => {
+    e.preventDefault()
+    const fd = new FormData(e.target)
+    const out = document.querySelector('#out')
+    out.textContent = 'Inscription...'
+
+    try {
+      const data = await api('/api/auth_register.php', { method: 'POST', body: fd })
+      out.textContent = JSON.stringify(data, null, 2)
+      location.hash = '#/login'
+    } catch (err) {
+      out.textContent = JSON.stringify(err, null, 2)
+    }
+  })
+}
+
+// ===== LOGOUT =====
+async function pageLogout() {
+  await api('/api/auth_logout.php', { method: 'POST' })
+  location.hash = '#/'
+}
+
+// ===== MES COMMANDES =====
+async function pageMesCommandes(me) {
+  if (!me) {
+    location.hash = '#/login'
+    return
+  }
+
+  app.innerHTML = layout(me, `<p>Chargement de tes commandes...</p>`)
+
+  const commandes = await api('/api/mes_commandes.php')
+
+  app.innerHTML = layout(me, `
+    <article class="card">
+      <h2 style="margin-top:0">Mes commandes</h2>
+
+      ${commandes.length ? `
+        <div style="display:grid; gap:10px">
+          ${commandes.map(c => `
+            <div class="card" style="box-shadow:none; margin:0">
+              <div style="display:flex; justify-content:space-between; gap:10px; flex-wrap:wrap;">
+                <b>#${c.id} — ${escapeHtml(c.menu_titre)}</b>
+                <span class="badge">${escapeHtml(c.dernier_statut ?? '—')}</span>
+              </div>
+              <div style="margin-top:8px; color:#64748b; font-size:14px">
+                ${Number(c.prix_total).toFixed(2)} € • ${c.nb_personnes} pers • ${escapeHtml(c.ville_livraison)}
+              </div>
+<div style="margin-top:10px">
+  <button class="btn" data-suivi="${c.id}">Suivi</button>
+  <div id="suivi-${c.id}" style="margin-top:10px; display:none; font-size:14px; color:#334155"></div>
+</div>
+
+            </div>
+          `).join('')}
+        </div>
+      ` : `
+        <p>Tu n’as pas encore de commande.</p>
+        <p><a href="#/">Voir les menus →</a></p>
+      `}
+    </article>
+  `)
+// Bouton Suivi : afficher l'historique des statuts
+document.querySelectorAll('button[data-suivi]').forEach(btn => {
+  btn.addEventListener('click', async () => {
+    const id = btn.getAttribute('data-suivi')
+    const box = document.getElementById(`suivi-${id}`)
+    if (!box) return
+
+    // toggle
+    if (box.style.display === 'block') {
+      box.style.display = 'none'
+      box.innerHTML = ''
+      return
+    }
+
+    box.style.display = 'block'
+    box.textContent = 'Chargement...'
+
+    try {
+      const statuts = await api(`/api/commandes_statuts.php?commande_id=${id}`)
+
+      if (!Array.isArray(statuts) || statuts.length === 0) {
+        box.textContent = 'Aucun statut.'
+        return
+      }
+
+const translate = {
+  accepte: "Acceptée",
+  en_preparation: "En préparation",
+  en_cours_de_livraison: "En cours de livraison",
+  livre: "Livrée",
+  en_attente_retour_materiel: "Retour matériel",
+  terminee: "Terminée"
+}
+
+box.innerHTML = `
+  <div style="border-left:3px solid #16a34a; padding-left:12px">
+    ${statuts.map(s => `
+      <div style="margin-bottom:8px">
+        <span style="color:#16a34a; font-weight:bold">✔</span>
+        <strong>${translate[s.statut] || escapeHtml(s.statut)}</strong>
+        <div style="font-size:12px; color:#64748b">
+          ${escapeHtml(s.created_at)}
+        </div>
+      </div>
+    `).join('')}
+  </div>
+`;
+
+    } catch (e) {
+      box.textContent = 'Erreur de chargement.'
+    }
+  })
+})
+}
+
+// ===== CONTACTS (messages reçus) =====
+async function pageContacts(me) {
+  if (!me) {
+    location.hash = '#/login'
+    return
+  }
+
+  // Accès réservé (recommandé ECF)
+  const role = (me.role || me.role_nom || me.role_name || '').toLowerCase()
+  if (role && role !== 'employe' && role !== 'admin') {
+    app.innerHTML = layout(me, `
+      <article class="card">
+        <h2 style="margin-top:0">Contacts reçus</h2>
+        <p class="sub">Accès réservé à un employé / admin.</p>
+      </article>
+    `)
+    loadHorairesFooter()
+    return
+  }
+
+  app.innerHTML = layout(me, `
+    <article class="card">
+      <h2 style="margin-top:0">Contacts reçus</h2>
+      <p class="sub">Messages envoyés via le formulaire de contact.</p>
+      <div id="contactsList" style="display:grid; gap:10px">
+        <div class="card" style="box-shadow:none; margin:0">Chargement…</div>
+      </div>
+    </article>
+  `)
+
+  try {
+    const list = await api('/api/contacts.php')
+    const box = document.getElementById('contactsList')
+    if (!box) return
+
+    if (!Array.isArray(list) || list.length === 0) {
+      box.innerHTML = `<div class="card" style="box-shadow:none; margin:0">Aucun message.</div>`
+      return
+    }
+
+    box.innerHTML = list.map(m => `
+      <div class="card" style="box-shadow:none; margin:0">
+        <div style="display:flex; justify-content:space-between; gap:10px; flex-wrap:wrap;">
+          <b>${escapeHtml(m.email ?? '—')}</b>
+          <small>${escapeHtml(m.created_at ?? '')}</small>
+        </div>
+        <div style="margin-top:6px"><b>${escapeHtml(m.titre ?? '')}</b></div>
+        <div style="margin-top:8px; white-space:pre-wrap">${escapeHtml(m.description ?? '')}</div>
+      </div>
+    `).join('')
+  } catch (err) {
+    const box = document.getElementById('contactsList')
+    if (box) box.innerHTML = `<div class="card" style="box-shadow:none; margin:0">Erreur de chargement.</div>`
+  }
+}
+
+// ===== DETAIL MENU + COMMANDE =====
+async function pageMenu(params, me) {
+  const id = params.get('id')
+  if (!id) return (location.hash = '#/')
+
+const data = await api(`/api/menu.php?id=${id}`)
+const m = data.menu
+const plats = data.plats
+
+  app.innerHTML = layout(me, `
+
+    <a href="#/">← Retour</a>
+
+    <article class="card" style="margin-top:16px">
+      <h2 style="margin-top:0">${escapeHtml(m.titre)}</h2>
+${m.image_url ? `<img src="${escapeHtml(m.image_url)}" alt="${escapeHtml(m.titre)}" style="width:100%; max-height:240px; object-fit:cover; border-radius:12px; margin:10px 0">` : ``}
+      <p class="desc">${escapeHtml(m.description ?? '')}</p>
+
+      <div class="meta">
+        <span class="badge">💰 ${Number(m.prix_min).toFixed(2)} €</span>
+        <span class="badge">👥 min ${m.nb_personnes_min} pers</span>
+        <span class="badge">📦 stock ${m.stock}</span>
+      </div>
+
+      <hr style="margin:16px 0">
+
+      <section style="margin:0 0 16px">
+        <h3 style="margin:0 0 10px">Plats du menu</h3>
+
+        <h4 style="margin:10px 0 6px">Entrées</h4>
+        <ul style="margin:0 0 10px">
+          ${(plats.entree || []).map(p => `
+           
+<li>
+  <b>${escapeHtml(p.nom)}</b>
+  ${p.description ? ` — ${escapeHtml(p.description)}` : ``}
+  ${p.allergenes ? `<br><small>Allergènes : ${escapeHtml(p.allergenes)}</small>` : ``}
+</li>
+
+          `).join('') || `<li>Aucune entrée</li>`}
+        </ul>
+
+        <h4 style="margin:10px 0 6px">Plats</h4>
+        <ul style="margin:0 0 10px">
+          ${(plats.plat || []).map(p => `
+     
+<li>
+  <b>${escapeHtml(p.nom)}</b>
+  ${p.description ? ` — ${escapeHtml(p.description)}` : ``}
+  ${p.allergenes ? `<br><small>Allergènes : ${escapeHtml(p.allergenes)}</small>` : ``}
+</li>
+
+          `).join('') || `<li>Aucun plat</li>`}
+        </ul>
+
+        <h4 style="margin:10px 0 6px">Desserts</h4>
+        <ul style="margin:0">
+          ${(plats.dessert || []).map(p => `
+     
+<li>
+  <b>${escapeHtml(p.nom)}</b>
+  ${p.description ? ` — ${escapeHtml(p.description)}` : ``}
+  ${p.allergenes ? `<br><small>Allergènes : ${escapeHtml(p.allergenes)}</small>` : ``}
+</li>
+          `).join('') || `<li>Aucun dessert</li>`}
+        </ul>
+      </section>
+
+      <h3 style="margin:0 0 10px">Commander ce menu</h3>
+
+      ${me ? `
+        <form id="orderForm" style="display:grid; gap:10px">
+          <label>Nb personnes
+            <input name="nb_personnes" type="number" min="${m.nb_personnes_min}" value="${m.nb_personnes_min}" required>
+          </label>
+
+          <label>Date prestation
+            <input name="date_prestation" type="date" required>
+          </label>
+
+          <label>Heure livraison
+            <input name="heure_livraison" type="time" required>
+          </label>
+
+          <label>Adresse livraison
+            <input name="adresse_livraison" type="text" required>
+          </label>
+
+          <label>Ville livraison
+            <input name="ville_livraison" type="text" required>
+          </label>
+
+          <label>Km hors Bordeaux (si ville ≠ Bordeaux)
+            <input name="km_hors_bordeaux" type="number" step="0.1" value="0">
+          </label>
+
+          <div class="card" style="box-shadow:none; border:1px dashed #cbd5e1; margin:12px 0;">
+            <h4 style="margin:0 0 8px">Détail du prix</h4>
+            <div id="priceBox" style="display:grid; gap:6px; font-size:14px; color:#334155">
+              <div>Prix menu : <b id="pMenu">—</b></div>
+              <div>Livraison : <b id="pLivraison">—</b></div>
+              <div>Réduction : <b id="pReduc">—</b></div>
+              <div style="border-top:1px solid #e2e8f0; padding-top:8px; margin-top:4px">
+                Total : <b id="pTotal">—</b>
+              </div>
+              <div style="color:#64748b; font-size:12px">
+                Livraison : 0€ à Bordeaux, sinon 5€ + 0,59€/km. Réduction -10% si min + 5 personnes.
+              </div>
+            </div>
+          </div>
+
+          <button type="submit">Valider la commande</button>
+        </form>
+        <pre id="orderResult" style="margin-top:12px; white-space:pre-wrap"></pre>
+      ` : `
+        <p>Tu dois être connecté pour commander.</p>
+        <p><a href="#/login">Se connecter →</a></p>
+      `}
+    </article>
+  `)
+
+    // defaults
+    // ===== PRIX : calcul + affichage avant validation =====
+    const form = document.querySelector('#orderForm')
+
+    // prix par personne estimé à partir du prix_min et du nb_personnes_min
+    const prixParPersonne = Number(m.prix_min) / Number(m.nb_personnes_min)
+
+    function isBordeaux(ville) {
+      const v = (ville || '').trim().toLowerCase()
+        .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+      return v === 'bordeaux'
+    }
+
+    function round2(n) {
+      return Math.round((n + Number.EPSILON) * 100) / 100
+    }
+
+    function updatePricePreview() {
+      const nb = Number(form.querySelector('input[name="nb_personnes"]').value || 0)
+      const ville = form.querySelector('input[name="ville_livraison"]').value || ''
+      const km = Number(form.querySelector('input[name="km_hors_bordeaux"]').value || 0)
+
+      let prixMenu = prixParPersonne * nb
+
+      const seuilReduc = Number(m.nb_personnes_min) + 5
+      let reduc = 0
+      if (nb >= seuilReduc) {
+        reduc = 0.10 * prixMenu
+      }
+
+      let livraison = 0
+      if (!isBordeaux(ville)) {
+        livraison = 5 + (0.59 * km)
+      }
+
+      const total = (prixMenu - reduc) + livraison
+
+      document.querySelector('#pMenu').textContent = `${round2(prixMenu).toFixed(2)} €`
+      document.querySelector('#pLivraison').textContent = `${round2(livraison).toFixed(2)} €`
+      document.querySelector('#pReduc').textContent = reduc > 0 ? `- ${round2(reduc).toFixed(2)} €` : `0.00 €`
+      document.querySelector('#pTotal').textContent = `${round2(total).toFixed(2)} €`
+    }
+
+    // valeurs par défaut
+    const kmInput = form.querySelector('input[name="km_hors_bordeaux"]')
+    if (!kmInput.value) kmInput.value = '0'
+
+    // MAJ immédiate + à chaque saisie
+    updatePricePreview()
+    form.addEventListener('input', updatePricePreview)
+
+    // ===== SUBMIT (création commande) =====
+    document.querySelector('#orderForm').addEventListener('submit', async (e) => {
+      e.preventDefault()
+
+      const fd = new FormData(e.target)
+      fd.append('user_id', String(me.id))
+      fd.append('menu_id', String(m.id))
+
+      const out = document.querySelector('#orderResult')
+      out.textContent = 'Envoi...'
+
+      try {
+        const data = await api('/api/commandes_create.php', { method: 'POST', body: fd })
+        out.textContent = JSON.stringify(data, null, 2)
+        setTimeout(() => { location.hash = '#/mes-commandes' }, 600)
+      } catch (err) {
+        out.textContent = JSON.stringify(err, null, 2)
+      }
+    })
+  }
+function pageMentionsLegales(me) {
+  return layout(me, `
+    <h2>Mentions légales</h2>
+
+    <p><strong>Nom du site :</strong> Vite & Gourmand</p>
+    <p><strong>Responsable :</strong> Vite & Gourmand</p>
+    <p><strong>Adresse :</strong> 12 rue de la Gastronomie, 33000 Bordeaux</p>
+    <p><strong>Email :</strong> contact@vite-gourmand.fr</p>
+    <p><strong>Téléphone :</strong> 05 56 00 00 00</p>
+
+    <p>
+      Ce site est un projet pédagogique réalisé dans le cadre de l’ECF
+      Développeur Web et Web Mobile.
+    </p>
+
+    <p>
+      <a href="#/">← Retour à l’accueil</a>
+    </p>
+  `)
+}
+function pageCGV(me) {
+  return layout(me, `
+    <h2>Conditions Générales de Vente (CGV)</h2>
+
+    <p>
+      Les présentes conditions générales de vente régissent les relations
+      contractuelles entre le client et le service Vite & Gourmand.
+    </p>
+
+    <h3>Commandes</h3>
+    <p>
+      Toute commande passée sur le site implique l’acceptation sans réserve
+      des présentes conditions générales de vente.
+    </p>
+
+    <h3>Prix</h3>
+    <p>
+      Les prix affichés sont exprimés en euros et incluent les prestations
+      de préparation des menus. Les frais de livraison peuvent s’ajouter
+      selon la zone de livraison.
+    </p>
+
+    <h3>Livraison</h3>
+    <p>
+      Les livraisons sont effectuées à l’adresse indiquée lors de la commande,
+      à la date et à l’heure convenues.
+    </p>
+
+    <h3>Annulation</h3>
+    <p>
+      Toute annulation doit être effectuée avant la validation de la commande
+      par le service Vite & Gourmand.
+    </p>
+
+    <p>
+      <a href="#/">← Retour à l’accueil</a>
+    </p>
+  `)
+}
+
+// =======================
+// PAGE : COMMANDES (employé/admin) + FILTRE STATUT
+// =======================
+async function pageCommandesManage(me) {
+  if (!me) { location.hash = '#/login'; return }
+
+  const role = (me.role || me.role_nom || '').toLowerCase()
+  const isStaff = role === 'employe' || role === 'admin'
+  if (!isStaff) {
+    app.innerHTML = layout(me, `
+      <article class="card">
+        <h2 style="margin-top:0">Commandes</h2>
+        <p class="sub">Accès réservé à un employé / admin.</p>
+      </article>
+    `)
+    loadHorairesFooter()
+    return
+  }
+
+  app.innerHTML = layout(me, `
+    <article class="card">
+      <h2 style="margin-top:0">Commandes</h2>
+      <p class="sub">Filtrer les commandes par statut.</p>
+
+      <section class="card" style="box-shadow:none; margin:0 0 12px; border:1px solid #e2e8f0">
+        <label>
+          Statut
+          <select id="fStatut">
+            <option value="">Tous</option>
+            <option value="accepte">Acceptée</option>
+            <option value="en_preparation">En préparation</option>
+            <option value="en_cours_de_livraison">En cours de livraison</option>
+            <option value="livre">Livrée</option>
+            <option value="en_attente_retour_materiel">En attente retour matériel</option>
+            <option value="terminee">Terminée</option>
+          </select>
+        </label>
+      </section>
+
+      <div id="cmdCount" style="margin:0 0 10px; color:#64748b"></div>
+
+      <div id="cmdList" style="display:grid; gap:10px">
+        <div class="card" style="box-shadow:none; margin:0">Chargement…</div>
+      </div>
+    </article>
+  `)
+
+  const listBox = document.getElementById('cmdList')
+  const countBox = document.getElementById('cmdCount')
+  const fStatut = document.getElementById('fStatut')
+
+  let data
+  try {
+    data = await api('/api/commandes.php')
+  } catch (e) {
+    listBox.innerHTML = `<div class="card" style="box-shadow:none; margin:0">Erreur de chargement.</div>`
+    loadHorairesFooter()
+    return
+  }
+
+  // selon le backend, ça peut être [...] ou {commandes:[...]}
+  const commandes = Array.isArray(data) ? data : (data.commandes || data.items || [])
+
+  function getStatut(c) {
+    return String(c.dernier_statut ?? c.statut ?? c.status ?? '').toLowerCase()
+  }
+
+  function render(rows) {
+    if (!Array.isArray(rows) || rows.length === 0) {
+      countBox.textContent = '0 commande'
+      listBox.innerHTML = `<div class="card" style="box-shadow:none; margin:0">Aucune commande.</div>`
+      return
+    }
+
+    countBox.textContent = `${rows.length} commande(s)`
+
+    listBox.innerHTML = rows.map(c => `
+      <div class="card" style="box-shadow:none; margin:0">
+        <div style="display:flex; justify-content:space-between; gap:10px; flex-wrap:wrap;">
+          <b>#${escapeHtml(c.id)} — ${escapeHtml(c.menu_titre ?? c.titre ?? 'Menu')}</b>
+          <span class="badge">${escapeHtml(getStatut(c) || '—')}</span>
+        </div>
+        <div style="margin-top:8px; color:#64748b; font-size:14px">
+          ${Number(c.prix_total || 0).toFixed(2)} € • ${escapeHtml(c.nb_personnes ?? '—')} pers • ${escapeHtml(c.ville_livraison ?? '')}
+        </div>
+        <div style="margin-top:8px; color:#64748b; font-size:13px">
+          Client : ${escapeHtml(c.user_email ?? c.email ?? '—')} • ${escapeHtml(c.created_at ?? '')}
+        </div>
+      </div>
+    `).join('')
+  }
+
+  function applyFilter() {
+    const wanted = String(fStatut.value || '').toLowerCase()
+    const filtered = !wanted ? commandes : commandes.filter(c => getStatut(c) === wanted)
+    render(filtered)
+  }
+
+  fStatut.addEventListener('change', applyFilter)
+
+  render(commandes)
+}
